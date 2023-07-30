@@ -63,6 +63,7 @@
 #![doc(html_root_url = "https://docs.rs/pkg-config/0.3")]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::error;
 use std::ffi::{OsStr, OsString};
@@ -83,6 +84,7 @@ pub struct Config {
     env_metadata: bool,
     print_system_libs: bool,
     print_system_cflags: bool,
+    whole_archive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +289,7 @@ impl Config {
             print_system_libs: true,
             cargo_metadata: true,
             env_metadata: true,
+            whole_archive: false,
         }
     }
 
@@ -296,6 +299,11 @@ impl Config {
     /// the crate documentation.
     pub fn statik(&mut self, statik: bool) -> &mut Config {
         self.statik = Some(statik);
+        self
+    }
+
+    pub fn whole_archive(&mut self, val: bool) -> &mut Config {
+        self.whole_archive = val;
         self
     }
 
@@ -589,6 +597,7 @@ impl Default for Config {
             print_system_libs: false,
             cargo_metadata: false,
             env_metadata: false,
+            whole_archive: false,
         }
     }
 }
@@ -698,6 +707,7 @@ impl Library {
         let statik = config.is_static(name);
 
         let words = split_flags(output);
+        let mut parsed_libs: HashSet<String> = HashSet::new();
 
         // Handle single-character arguments like `-I/usr/include`
         let parts = words
@@ -726,12 +736,35 @@ impl Library {
                         continue;
                     }
 
+                    // Extract foo from -l:libfoo.a so that we could add link
+                    // modifiers for this lib.
+                    let val = if val.starts_with(':')
+                        && config.statik.unwrap_or(false)
+                        && is_static_lib(&val[1..]).is_some()
+                    {
+                        is_static_lib(&val[1..]).unwrap()
+                    } else {
+                        val
+                    };
+
                     if val.starts_with(':') {
                         // Pass this flag to linker directly.
                         let meta = format!("cargo:rustc-link-arg={}{}", flag, val);
                         config.print_metadata(&meta);
                     } else if statik && is_static_available(val, &system_roots, &dirs) {
-                        let meta = format!("rustc-link-lib=static={}", val);
+                        // We cann't override link modifiers for lib more than once
+                        // even if the modifiers is same.
+                        if parsed_libs.contains(val) {
+                            continue;
+                        }
+                        parsed_libs.insert(val.to_string());
+
+                        let meta = if config.whole_archive {
+                            // whole_archive is conflict with bundle.
+                            format!("rustc-link-lib=static:-bundle,+whole-archive={}", val)
+                        } else {
+                            format!("rustc-link-lib=static={}", val)
+                        };
                         config.print_metadata(&meta);
                     } else {
                         let meta = format!("rustc-link-lib={}", val);
@@ -851,6 +884,14 @@ fn is_static_available(name: &str, system_roots: &[PathBuf], dirs: &[PathBuf]) -
     dirs.iter().any(|dir| {
         !system_roots.iter().any(|sys| dir.starts_with(sys)) && dir.join(&libname).exists()
     })
+}
+
+fn is_static_lib(lib_file: &str) -> Option<&str> {
+    if lib_file.starts_with("lib") && lib_file.ends_with(".a") {
+        Some(&lib_file[3..lib_file.len() - 2])
+    } else {
+        None
+    }
 }
 
 /// Split output produced by pkg-config --cflags and / or --libs into separate flags.
